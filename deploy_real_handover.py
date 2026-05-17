@@ -884,7 +884,13 @@ def main():
             # Update Bayesian model EVERY cycle (not only after contact).
             # Without contact the data is low-signal so uncertainty stays high;
             # once the human grasps, forces appear and the model converges.
-            model.update(u_z, fz_world)
+            #
+            # SIGN CONVENTION: The real FT sensor gives f ∝ −u (force opposes
+            # motion — human pushes down when robot moves up).  The simulation's
+            # check_firm_grasp() expects f ∝ +u (spring-like, both w_up and
+            # w_down positive).  We negate fz_world so the model sees the
+            # simulation convention: resistance force = −fz_measured.
+            model.update(u_z, -fz_world)
 
             # Check for firm grasp (runs every cycle)
             if model.check_firm_grasp():
