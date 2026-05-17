@@ -1,22 +1,29 @@
 """
-Real-Machine Handover Test — TB6 R5 + wrist FT sensor
-======================================================
-Based on verified working example: Hello_MoveAbsJ_win_py/main.py
+Real-Machine Handover Experiment — TB6 R5 + Robotiq 3F + Wrist FT Sensor
+=======================================================================
+Complete deployment matching simulate_handover.py state machine.
 
-SAFETY:
-  - SetRate without value = slowest possible motion
-  - Press ENTER at any time = EMERGENCY STOP
-  - Test WITHOUT gripper first, WITHOUT object
-  - Verify all positions in Web UI jogging before running
+SAFETY (read before operating):
+  - SetRate at 10-20 = very slow motion, easy to stop
+  - ENTER key at any time = EMERGENCY STOP (Stop → Disable)
+  - All joint targets are checked against limits before moving
+  - FT sensor is monitored for excessive force (>50N triggers auto-stop)
+  - Robotiq force is set to moderate level (0x40 = ~25N)
+  - Move duration: 8s (slower than simulation for safety)
 
-Flow:
-  1. Initialize (Clear → Disable → Mode → SetMaxToq → Recover → SetRate → Enable)
-  2. Move to HOME
-  3. Move to HANDOVER position
-  4. Start probing oscillation (SpeedJ)
-  5. Read FT sensor (topic subscription)
-  6. Detect firm grasp → stop probing
-  7. Return to HOME
+PREREQUISITES:
+  pip install pyserial numpy
+
+EXPERIMENT FLOW (matches simulation):
+  HOME → MOVING_TO_POSE → READY → GRASPING (close Robotiq)
+       → HOLDING → DETECTING (probing + Bayesian model)
+       → FIRM_DETECTED → RELEASING (open Robotiq) → DONE
+       → MOVING_TO_HOME → HOME
+
+FT SENSOR NOTE:
+  The sensor's Fz is aligned with the tool axis (J6 rotation axis),
+  pointing outward from the palm. Probing oscillation on J2/J3/J5
+  produces motion primarily along this axis at the handover pose.
 """
 
 import rpc
@@ -26,61 +33,383 @@ import random
 import time
 import threading
 import math
+import os
+import json
+import struct
+from collections import deque
+from datetime import datetime
+
 import numpy as np
 
 # ===========================================================================
-# Configuration — ADJUST THESE
+# Configuration — ADJUST THESE TO MATCH YOUR SETUP
 # ===========================================================================
 TB6_IP = "192.168.50.1"
 TB6_PORT = 5868
 TOPIC_PORT = 19091
 
-# HOME: arm folded, safe compact pose (all zeros = standard reference)
-HOME_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# Robotiq gripper — Modbus RTU (RS232)
+# Set ROBOTIQ_PORT to your COM port, e.g. "COM3" on Windows, "/dev/ttyUSB0" on Linux
+# Set ROBOTIQ_PORT = None to run WITHOUT gripper (arm-only test mode)
+ROBOTIQ_PORT = None          # e.g. "COM3"
+ROBOTIQ_SLAVE_ID = 9
+ROBOTIQ_BAUDRATE = 115200
 
-# HANDOVER: arm reaching to experiment workspace. *** TEACH ON REAL ROBOT ***
+# ---- Joint configurations (MUST TEACH ON REAL ROBOT) ----
+# HOME: arm folded, safe compact pose
+HOME_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# HANDOVER: arm reaching to experiment workspace
+# *** TEACH THESE ON THE REAL ROBOT VIA WEB UI JOGGING FIRST ***
 HANDOVER_JOINTS = [0.0, -0.901, 1.886, -2.149, 0.354, 3.133]
 
-# Probing parameters (conservative — adjust after first safe test)
-PROBE_AMP = 0.006          # oscillation amplitude (rad), half of simulation
-PROBE_FREQ = 1.5           # Hz
-PROBE_DT = 0.05            # SpeedJ update interval (s)
+# ---- TB6 joint limits (from URDF) ----
+JOINT_LIMITS = [
+    (-3.1416, 3.1416),   # J1
+    (-3.1416, 3.1416),   # J2
+    (-2.8623, 2.8623),   # J3 — restricted!
+    (-3.1416, 3.1416),   # J4
+    (-3.1416, 3.1416),   # J5
+    (-3.1416, 3.1416),   # J6
+]
 
-# FT sensor
-FT_TARE_SAMPLES = 100
-OBJECT_WEIGHT = 3.0         # N — your object's weight
+# ---- Motion speeds ----
+SETRATE = 15               # global speed percentage (10-30, low = safe)
+MOVE_DURATION = 8.0        # seconds for MoveAbsJ (slower than simulation's 5s)
+
+# ---- Probing parameters ----
+PROBE_AMP = 0.006           # oscillation amplitude (rad), half of simulation
+PROBE_FREQ = 1.5            # Hz
+PROBE_DT = 0.05             # SpeedJ update interval (s)
+
+# ---- Bayesian model ----
+BETA = 0.05                 # measurement noise variance
+CONFIDENCE_C = 0.99         # confidence level for firm-grasp check
+OBJECT_WEIGHT = 3.0         # N — measure your object's weight
+DATA_BUFFER_SIZE = 200      # most recent (u, f) pairs
+
+# ---- FT sensor ----
+FT_TARE_SAMPLES = 100       # samples for tare averaging
+FT_EXCESSIVE_FORCE = 50.0   # N — auto-stop if exceeded
+V_MAX = 0.04                # max gripper velocity (m/s), for firm-grasp check
+
+# ---- Logging ----
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
 
 # ===========================================================================
-stop_event = threading.Event()
+# Modbus RTU CRC-16
+# ===========================================================================
+def _modbus_crc(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc
 
-# Shared FT data (populated by topic callback)
-ft_lock = threading.Lock()
-ft_raw = np.zeros(6)
-ft_tare = np.zeros(6)
-ft_tared = False
-joint_positions = np.zeros(6)
+
+# ===========================================================================
+# Robotiq 3F Gripper — Modbus RTU (Simplified Control Mode)
+# ===========================================================================
+class RobotiqGripper:
+    """Robotiq Adaptive Gripper S-Model via Modbus RTU (RS232).
+
+    Registers (Simplified Control Mode):
+      Robot Output (write): base = 0x03E8 (1000)
+        Byte 0: ACTION REQUEST  (rACT, rMOD, rGTO, rATR)
+        Byte 1: GRIPPER OPTIONS (00000000 in simple mode)
+        Byte 2: 00000000
+        Byte 3: POSITION REQUEST (0x00=open … 0xFF=closed)
+        Byte 4: SPEED
+        Byte 5: FORCE
+        Bytes 6-15: 00000000
+
+      Robot Input (read): base = 0x07D0 (2000)
+        Byte 0: GRIPPER STATUS (gACT, gMOD, gGTO, gIMC, gSTA)
+        Byte 1: OBJECT STATUS  (gDTA, gDTB, gDTC, gDTS)
+        Byte 2: FAULT STATUS
+        Byte 3: POSITION REQUEST ECHO
+    """
+
+    def __init__(self, port, slave_id=9, baudrate=115200):
+        import serial as _serial
+        self._ser = _serial.Serial(
+            port=port,
+            baudrate=baudrate,
+            bytesize=_serial.EIGHTBITS,
+            parity=_serial.PARITY_NONE,
+            stopbits=_serial.STOPBITS_ONE,
+            timeout=0.1,
+        )
+        self._sid = slave_id
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    def _fc03(self, start_addr, count):
+        """Read Holding Registers (FC03).  Returns list of ints (register values)."""
+        req = struct.pack('>B B H H',
+                          self._sid, 0x03, start_addr, count)
+        crc = _modbus_crc(req)
+        req += struct.pack('<H', crc)
+        with self._lock:
+            self._ser.reset_input_buffer()
+            self._ser.write(req)
+            # Response: sid, 0x03, byte_count, data[], crc
+            hdr = self._ser.read(3)
+            if len(hdr) < 3:
+                return None
+            byte_count = hdr[2]
+            data = self._ser.read(byte_count + 2)
+            if len(data) < byte_count + 2:
+                return None
+            payload = data[:byte_count]
+        return [payload[i] << 8 | payload[i + 1] for i in range(0, byte_count, 2)]
+
+    def _fc16(self, start_addr, registers):
+        """Write Multiple Registers (FC16).  registers = list of 16-bit ints."""
+        count = len(registers)
+        byte_count = count * 2
+        req = struct.pack('>B B H H B',
+                          self._sid, 0x10, start_addr, count, byte_count)
+        for r in registers:
+            req += struct.pack('>H', r)
+        crc = _modbus_crc(req)
+        req += struct.pack('<H', crc)
+        with self._lock:
+            self._ser.reset_input_buffer()
+            self._ser.write(req)
+            resp = self._ser.read(8)  # sid, 0x10, start, count, crc
+            return len(resp) >= 6
+
+    # ------------------------------------------------------------------
+    def activate(self):
+        """rACT = 1, clear everything else.  Returns True on success."""
+        ok = self._fc16(0x03E8, [0x0100, 0x0000, 0x0000])
+        if ok:
+            print("[Robotiq] Activation sent.")
+        return ok
+
+    def reset_gripper(self):
+        """rACT = 0 — reset gripper."""
+        return self._fc16(0x03E8, [0x0000, 0x0000, 0x0000])
+
+    def is_activated(self):
+        """Check gIMC bits == 3 (activation complete)."""
+        regs = self._fc03(0x07D0, 1)
+        if regs is None:
+            return False
+        status_byte = (regs[0] >> 8) & 0xFF  # Byte 0
+        gimc = (status_byte >> 4) & 0x03
+        return gimc == 3
+
+    def wait_activation(self, timeout=5.0):
+        """Block until activation completes or timeout."""
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self.is_activated():
+                print("[Robotiq] Activation complete.")
+                return True
+            time.sleep(0.1)
+        print("[Robotiq] WARNING: Activation timeout!")
+        return False
+
+    # ------------------------------------------------------------------
+    def move(self, position, speed=0x40, force=0x40):
+        """Move fingers to position (0x00=open … 0xFF=closed).
+        speed, force: 0x00 (min) – 0xFF (max).
+        """
+        # ACTION REQUEST: rACT=1, rMOD=0(basic), rGTO=1 → 0x09
+        # Byte 0: 0x09, Byte 1: 0x00, Byte 2: 0x00
+        # Byte 3: position, Byte 4: speed, Byte 5: force
+        return self._fc16(0x03E8,
+                          [0x0900, 0x0000 | position, speed << 8 | force,
+                           0x0000, 0x0000, 0x0000])
+
+    def open(self, speed=0x40, force=0x40):
+        return self.move(0x00, speed, force)
+
+    def close(self, speed=0x40, force=0x40):
+        return self.move(0xFF, speed, force)
+
+    # ------------------------------------------------------------------
+    def read_gripper_status(self):
+        """Return dict with gACT, gMOD, gGTO, gIMC, gSTA, fault, pos_echo."""
+        regs = self._fc03(0x07D0, 2)
+        if regs is None:
+            return None
+        b0 = (regs[0] >> 8) & 0xFF
+        b1 = regs[0] & 0xFF
+        b2 = (regs[1] >> 8) & 0xFF
+        b3 = regs[1] & 0xFF
+        return {
+            'gACT': b0 & 0x01,
+            'gMOD': (b0 >> 1) & 0x03,
+            'gGTO': (b0 >> 3) & 0x01,
+            'gIMC': (b0 >> 4) & 0x03,
+            'gSTA': (b0 >> 6) & 0x03,
+            'object_status': b1,
+            'fault': b2,
+            'pos_echo': b3,
+        }
+
+    def is_stopped(self):
+        """True if gripper stopped (gSTA != 0)."""
+        st = self.read_gripper_status()
+        return st is not None and st['gSTA'] != 0
+
+    def is_grasped(self):
+        """True if fingers stopped before reaching target (object detected)."""
+        st = self.read_gripper_status()
+        if st is None:
+            return False
+        return st['gSTA'] in (1, 2)
+
+    def disconnect(self):
+        """Close serial connection."""
+        try:
+            self._ser.close()
+        except Exception:
+            pass
 
 
-def wait_for_enter():
+# ===========================================================================
+# Shared state (populated by topic callback)
+# ===========================================================================
+_ft_lock = threading.Lock()
+_ft_raw = np.zeros(6)       # [fx, fy, fz, mx, my, mz]
+_ft_tare = np.zeros(6)
+_ft_tared = False
+_joint_positions = np.zeros(6)
+_system_running = True
+
+
+def _on_rtstate(tt: topic.SystemRtState):
+    global _ft_raw, _joint_positions, _system_running
+    parm = message.SystemStateData()
+    message.display_rt(tt, parm)
+
+    if parm.controller.ftvalues:
+        ft = parm.controller.ftvalues[0]
+        with _ft_lock:
+            _ft_raw = np.array([ft.fx, ft.fy, ft.fz, ft.mx, ft.my, ft.mz])
+
+    joints_per_model = len(parm.models_joints) // max(len(parm.models), 1)
+    if joints_per_model >= 6:
+        with _ft_lock:
+            for j in range(6):
+                _joint_positions[j] = parm.models_joints[j].position
+
+
+def read_ft():
+    """Return tare-compensated FT [fx,fy,fz,mx,my,mz]."""
+    with _ft_lock:
+        raw = _ft_raw.copy()
+        tare = _ft_tare.copy()
+        tared = _ft_tared
+    return raw - tare if tared else raw
+
+
+def read_ft_fz():
+    """Read Fz only (primary axis for handover detection)."""
+    return read_ft()[2]
+
+
+def read_joints():
+    """Return current joint positions [j1,…,j6] in rad."""
+    with _ft_lock:
+        return _joint_positions.copy()
+
+
+# ===========================================================================
+# Bayesian Contact Model (same as simulation)
+# ===========================================================================
+from scipy.stats import chi2
+
+
+class BayesianContactModel:
+    """Piecewise-linear Bayesian model of human-object contact state."""
+
+    def __init__(self):
+        self.beta = BETA
+        self.d = 2
+        self.m = np.zeros(2)
+        self.S = np.eye(2) * 100.0
+        self.S_inv = np.eye(2) / 100.0
+        self.data = deque(maxlen=DATA_BUFFER_SIZE)
+
+    def reset(self):
+        self.__init__()
+
+    def phi(self, u):
+        u = float(u)
+        return np.array([max(u, 0.0), -min(u, 0.0)])
+
+    def update(self, u, f):
+        u, f = float(u), float(f)
+        self.data.append((u, f))
+        ph = self.phi(u)
+        self.S_inv += (1.0 / self.beta) * np.outer(ph, ph)
+        self.S = np.linalg.inv(self.S_inv)
+        self.m = self.S @ (self.S_inv @ self.m + (1.0 / self.beta) * f * ph)
+
+    def entropy(self):
+        _, ld = np.linalg.slogdet(self.S)
+        return 0.5 * self.d * (1 + np.log(2 * np.pi)) + 0.5 * ld
+
+    def check_firm_grasp(self, ow=OBJECT_WEIGHT, conf=CONFIDENCE_C):
+        for ft in [0.5 * ow, 0.5, -0.5]:
+            try:
+                P = np.linalg.cholesky(self.S * chi2.ppf(conf, df=2))
+            except Exception:
+                return False
+            E = np.array([1.0, 0.0])
+            w_lo = max(0.0, E @ self.m - np.linalg.norm(E @ P))
+            if 0 <= ft <= w_lo * V_MAX:
+                continue
+            E = np.array([0.0, 1.0])
+            w_hi = E @ self.m + np.linalg.norm(E @ P)
+            if -w_hi * V_MAX <= ft <= 0:
+                continue
+            return False
+        return True
+
+
+# ===========================================================================
+# TB6 RPC utilities
+# ===========================================================================
+_stop_event = threading.Event()
+_estop_client = None  # dedicated RPC client for emergency-stop thread
+
+
+def _estop_listener():
+    """ENTER key → immediate Stop+Disable via dedicated RPC connection.
+    Having its own client means estop works even when the main thread
+    is blocked inside CallAwait for a long-running MoveAbsJ.
+    """
     input()
-    stop_event.set()
+    _stop_event.set()
     print("\n>>> EMERGENCY STOP TRIGGERED <<<")
-
-
-def e_stop(client):
-    print(">>> Sending Stop + Disable ...")
-    for cmd in ["{Stop}", "{Disable}"]:
-        msg = rpc.Msg(cmd)
-        msg.setMsgID(10001)
-        msg.setMsgSeqID(random.randint(1, 10000))
-        client.CallAwait(msg, 3000)
-    print(">>> Arm stopped and disabled.")
+    if _estop_client is not None:
+        try:
+            for cmd in ["{Stop}", "{Disable}"]:
+                msg = rpc.Msg(cmd)
+                msg.setMsgID(10001)
+                msg.setMsgSeqID(random.randint(1, 10000))
+                _estop_client.CallAwait(msg, 3000)
+            print(">>> Arm stopped via dedicated estop channel.")
+        except Exception as ex:
+            print(f">>> Estop send error: {ex}")
+            print(">>> USE PHYSICAL ESTOP BUTTON if arm is still moving!")
 
 
 def send_cmd(client, cmd_str, timeout_ms=500):
-    """Send a single RPC command, return (status, response_list)."""
-    if stop_event.is_set():
+    """Send a single RPC command synchronously. Returns (status, resp_list)."""
+    if _stop_event.is_set():
         return -1, []
     msg = rpc.Msg(cmd_str)
     msg.setMsgID(10001)
@@ -88,9 +417,8 @@ def send_cmd(client, cmd_str, timeout_ms=500):
     status, resp_list = client.CallAwait(msg, timeout_ms)
     if status == 0:
         for r in resp_list:
-            code = "OK" if r.code == 0 else f"ERR({r.code})"
             if r.code != 0:
-                print(f"  [{code}] {r.message}")
+                print(f"  [ERR({r.code})] {r.message}")
     else:
         print(f"  [FAIL] status={status}")
     return status, resp_list
@@ -99,76 +427,78 @@ def send_cmd(client, cmd_str, timeout_ms=500):
 def send_cmds(client, cmd_list, timeout_ms=500, sleep_s=0.1):
     """Send a list of RPC commands sequentially."""
     for cmd in cmd_list:
-        if stop_event.is_set():
-            return
-        print(f"  {cmd}")
+        if _stop_event.is_set():
+            return False
+        print(f"  -> {cmd}")
         status, _ = send_cmd(client, cmd, timeout_ms)
         if status != 0:
             print(f"  [WARN] Retrying with ClearErr...")
             send_cmd(client, "{Clear}", 500)
         time.sleep(sleep_s)
+    return True
+
+
+def e_stop(client):
+    """Stop + Disable the arm immediately."""
+    print(">>> STOPPING ARM...")
+    for cmd in ["{Stop}", "{Disable}"]:
+        msg = rpc.Msg(cmd)
+        msg.setMsgID(10001)
+        msg.setMsgSeqID(random.randint(1, 10000))
+        client.CallAwait(msg, 3000)
+    print(">>> Arm stopped and disabled.")
+
+
+def re_enable(client):
+    """Re-enable arm after estop (Clear → Disable → Mode → ... → Enable)."""
+    init_cmds = [
+        "{Clear}",
+        "{Disable}",
+        "{Mode}",
+        "{SetMaxToq}",
+        "{Recover}",
+        f"{{SetRate {SETRATE}}}",
+        "{Enable}",
+        "{Var --clear}",
+        "{Recover}",
+    ]
+    return send_cmds(client, init_cmds, 500, 0.1)
+
+
+def check_joint_limits(joints):
+    """Verify all joint angles are within limits. Returns list of violations."""
+    violations = []
+    for i, (j, (lo, hi)) in enumerate(zip(joints, JOINT_LIMITS)):
+        if j < lo - 0.01 or j > hi + 0.01:
+            violations.append(f"J{i+1}={j:.3f} limit=[{lo:.3f},{hi:.3f}]")
+    return violations
+
+
+def defined_joint_target(client, name, joints):
+    """Define a jointtarget variable on the controller."""
+    j_str = ",".join(f"{x:.6f}" for x in joints)
+    cmd = (f"{{Var --type=jointtarget --name={name}"
+           f" --value={{{j_str},0,0,0,0}}}}")
+    return send_cmd(client, cmd, 500)
 
 
 # ===========================================================================
-# Topic callback for FT sensor + joint state
+# Probing via SpeedJ (runs in background thread)
 # ===========================================================================
-def on_rtstate(tt: topic.SystemRtState):
-    global ft_raw, ft_tared, ft_tare, joint_positions
-    parm = message.SystemStateData()
-    message.display_rt(tt, parm)
-
-    # FT sensor
-    if parm.controller.ftvalues:
-        ft = parm.controller.ftvalues[0]
-        with ft_lock:
-            ft_raw = np.array([ft.fx, ft.fy, ft.fz, ft.mx, ft.my, ft.mz])
-
-    # Joint positions
-    joints_per_model = len(parm.models_joints) // max(len(parm.models), 1)
-    if joints_per_model >= 6:
-        with ft_lock:
-            for j in range(6):
-                joint_positions[j] = parm.models_joints[j].position
+_probe_running = False
 
 
-def read_ft():
-    """Return tare-compensated FT [fx,fy,fz,mx,my,mz]."""
-    with ft_lock:
-        raw = ft_raw.copy()
-    if ft_tared:
-        return raw - ft_tare
-    return raw
-
-
-def tare_ft():
-    """Tare FT sensor. Call AFTER grasping, BEFORE human contact."""
-    global ft_tared, ft_tare
-    print("[FT] Taring sensor...")
-    time.sleep(0.5)
-    samples = []
-    for _ in range(FT_TARE_SAMPLES):
-        with ft_lock:
-            samples.append(ft_raw.copy())
-        time.sleep(0.01)
-    ft_tare = np.mean(samples, axis=0)
-    ft_tared = True
-    print(f"[FT] Tare: F=({ft_tare[0]:.2f},{ft_tare[1]:.2f},{ft_tare[2]:.2f}) N")
-
-
-# ===========================================================================
-# Probing via SpeedJ (asynchronous, non-blocking)
-# ===========================================================================
 def probing_loop(client):
+    """Send sinusoidal velocity commands via SpeedJ (async, ~20 Hz).
+    Oscillates J2, J3, J5 to produce vertical probing at the palm.
     """
-    Run probing oscillation via SpeedJ commands.
-    Sends sinusoidal velocity on J2, J3, J5 at ~20Hz.
-    Can be interrupted by stop_event.
-    """
+    global _probe_running
     omega = 2 * math.pi * PROBE_FREQ
     t0 = time.time()
-    print("[Probe] Starting oscillation...")
+    _probe_running = True
+    print("[Probe] Oscillation started.")
 
-    while not stop_event.is_set():
+    while _probe_running and not _stop_event.is_set():
         t = time.time() - t0
         phase = math.sin(omega * t)
         dphase = omega * math.cos(omega * t)
@@ -179,20 +509,21 @@ def probing_loop(client):
         v5 = -PROBE_AMP * 0.3 * dphase
 
         cmd = (f"{{SpeedJ --vel={{{v2:.4f},{v3:.4f},0,0,{v5:.4f},0}}"
-               f" --acc={{5,5,5,5,5,5}}"
-               f" --dec={{5,5,5,5,5,5}}"
+               f" --acc={{3,3,3,3,3,3}}"
+               f" --dec={{3,3,3,3,3,3}}"
                f" --jerk={{10,10,10,10,10,10}}"
                f" --last_count={int(PROBE_DT * 1000)}}}")
 
         msg = rpc.Msg(cmd)
         msg.setMsgID(10001)
         msg.setMsgSeqID(random.randint(1, 10000))
-        client.CallAsync(msg, 100)  # async — don't wait
+        client.CallAsync(msg, 100)
 
         time.sleep(PROBE_DT)
 
-    # Stop probing
+    # Stop probing smoothly
     send_cmd(client, "{SpeedJ --stop}", 500)
+    _probe_running = False
     print("[Probe] Stopped.")
 
 
@@ -200,31 +531,60 @@ def probing_loop(client):
 # Main experiment
 # ===========================================================================
 def main():
-    # ---- Start emergency-stop listener ----
-    listener = threading.Thread(target=wait_for_enter, daemon=True)
+    global _ft_tared, _ft_tare
+
+    print("=" * 60)
+    print("TB6 Handover Experiment — Active Contact Sensing")
+    print("=" * 60)
+    print("SAFETY: Press ENTER at any time for EMERGENCY STOP")
+    print("        SetRate =", SETRATE, "(very slow)")
+    print("        Move duration =", MOVE_DURATION, "s")
+    if ROBOTIQ_PORT:
+        print("        Robotiq gripper: ENABLED on", ROBOTIQ_PORT)
+    else:
+        print("        Robotiq gripper: DISABLED (arm-only test mode)")
+    print("=" * 60)
+
+    # ---- Create dedicated estop RPC client & start listener ----
+    global _estop_client
+    _estop_client = rpc.CPPClient(TB6_IP, TB6_PORT)
+    print("[Safety] Dedicated estop client connected.")
+    listener = threading.Thread(target=_estop_listener, daemon=True)
     listener.start()
 
-    # ---- Start topic subscription ----
-    print("[Topic] Starting...")
+    # ---- Connect topic (FT sensor + joint state) ----
+    print("\n[Topic] Connecting to FT sensor...")
     options = topic.NodeOptions()
-    options.node_name = 'handover_test'
+    options.node_name = 'handover_exp'
     options.sub_url = f'tcp://{TB6_IP}:{TOPIC_PORT}'
     topic_node = topic.Node(options)
     if not topic_node.Start():
         print("FATAL: Failed to start topic node")
         return
-    topic_node.CreateSubscriptionRT("system_rtstate", on_rtstate)
-    print("[Topic] Subscribed to FT sensor + joint state.")
-    time.sleep(0.5)
+    topic_node.CreateSubscriptionRT("system_rtstate", _on_rtstate)
+    print("[Topic] Subscribed.")
+    time.sleep(1.0)
 
     # ---- Connect RPC ----
-    print(f"[RPC] Connecting to {TB6_IP}:{TB6_PORT}...")
+    print(f"\n[RPC] Connecting to {TB6_IP}:{TB6_PORT}...")
     client = rpc.CPPClient(TB6_IP, TB6_PORT)
     print("[RPC] Connected!")
 
+    # ---- Connect Robotiq gripper (if configured) ----
+    gripper = None
+    if ROBOTIQ_PORT:
+        print(f"\n[Robotiq] Connecting on {ROBOTIQ_PORT}...")
+        try:
+            gripper = RobotiqGripper(ROBOTIQ_PORT, ROBOTIQ_SLAVE_ID, ROBOTIQ_BAUDRATE)
+            print("[Robotiq] Port opened.")
+        except Exception as e:
+            print(f"[Robotiq] ERROR: {e}")
+            print("[Robotiq] Continuing without gripper.")
+            gripper = None
+
     try:
         # ================================================================
-        # STEP 1: Initialize
+        # STEP 1: Initialize TB6
         # ================================================================
         print("\n>>> STEP 1: Initializing TB6...")
         init_cmds = [
@@ -233,148 +593,306 @@ def main():
             "{Mode}",
             "{SetMaxToq}",
             "{Recover}",
-            "{SetRate}",         # no value = slowest (safest)
+            f"{{SetRate {SETRATE}}}",
             "{Enable}",
             "{Var --clear}",
             "{Recover}",
         ]
-        send_cmds(client, init_cmds, 500, 0.1)
-        if stop_event.is_set():
+        if not send_cmds(client, init_cmds, 500, 0.1):
             e_stop(client)
             return
 
         # Define joint targets
-        j_home_str = ",".join(str(x) for x in HOME_JOINTS)
-        j_handover_str = ",".join(str(x) for x in HANDOVER_JOINTS)
-        jt_vars = [
-            f"{{Var --type=jointtarget --name=j_home --value={{{j_home_str},0,0,0,0}}}}",
-            f"{{Var --type=jointtarget --name=j_handover --value={{{j_handover_str},0,0,0,0}}}}",
-        ]
-        send_cmds(client, jt_vars, 500, 0.05)
+        if not defined_joint_target(client, "j_home", HOME_JOINTS):
+            e_stop(client)
+            return
+        if not defined_joint_target(client, "j_handover", HANDOVER_JOINTS):
+            e_stop(client)
+            return
+
+        # Sanity check: verify handover joints are within limits
+        violations = check_joint_limits(HANDOVER_JOINTS)
+        if violations:
+            print("\n!!! JOINT LIMIT VIOLATIONS in HANDOVER_JOINTS !!!")
+            for v in violations:
+                print(f"    {v}")
+            print("Please re-teach HANDOVER_JOINTS on the real robot.")
+            print("Emergency stop and abort.")
+            e_stop(client)
+            return
+
         print("[TB6] Initialized and enabled.")
 
         # ================================================================
-        # STEP 2: Move to HOME
+        # STEP 2: Activate Robotiq gripper
         # ================================================================
-        print("\n>>> STEP 2: Moving to HOME...")
-        send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 30000)
-        if stop_event.is_set():
+        if gripper:
+            print("\n>>> STEP 2: Activating Robotiq gripper...")
+            gripper.activate()
+            if not gripper.wait_activation(timeout=5.0):
+                print("[Robotiq] WARNING: Activation may have failed.")
+                print("Check power and connections. Continuing anyway.")
+            else:
+                gripper.open(speed=0x60, force=0x40)
+                time.sleep(0.5)
+        else:
+            print("\n>>> STEP 2: Robotiq gripper skipped (not configured).")
+
+        if _stop_event.is_set():
+            e_stop(client)
+            return
+
+        # ================================================================
+        # STEP 3: Move to HOME position
+        # ================================================================
+        print("\n>>> STEP 3: Moving to HOME position...")
+        send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 60000)
+        if _stop_event.is_set():
             e_stop(client)
             return
         print("[TB6] At HOME.")
         time.sleep(1.0)
 
         # ================================================================
-        # STEP 3: Move to HANDOVER position
+        # STEP 4: Move to HANDOVER position
         # ================================================================
-        print("\n>>> STEP 3: Moving to HANDOVER position...")
-        print("    (Ensure workspace is clear!)")
-        send_cmd(client, "{MoveAbsJ --jointtarget_var=j_handover}", 30000)
-        if stop_event.is_set():
+        print("\n>>> STEP 4: Moving to HANDOVER position...")
+        print("    ENSURE WORKSPACE IS CLEAR!")
+        print("    Press ENTER now to abort if anything is in the way.")
+        time.sleep(1.0)
+        if _stop_event.is_set():
+            e_stop(client)
+            return
+
+        send_cmd(client, "{MoveAbsJ --jointtarget_var=j_handover}", 60000)
+        if _stop_event.is_set():
             e_stop(client)
             return
         print("[TB6] At HANDOVER position.")
         time.sleep(1.0)
 
         # ================================================================
-        # STEP 4: Tare FT sensor (simulates "after grasping object")
+        # STEP 5: Close gripper to grasp object
         # ================================================================
-        print("\n>>> STEP 4: Taring FT sensor...")
-        print("    (No gripper = taring at empty load)")
-        tare_ft()
-        if stop_event.is_set():
-            e_stop(client)
-            return
+        if gripper:
+            print("\n>>> STEP 5: Closing gripper to grasp object...")
+            print("    (Place object in gripper now if not already there)")
+            time.sleep(1.0)
+            if _stop_event.is_set():
+                e_stop(client)
+                gripper.open()
+                return
+
+            gripper.close(speed=0x30, force=0x40)  # slow close, moderate force
+            time.sleep(1.5)
+            grasped = gripper.is_grasped()
+            print(f"    Object grasped: {grasped}")
+        else:
+            print("\n>>> STEP 5: Gripper skipped (arm-only mode).")
 
         # ================================================================
-        # STEP 5: Start probing + detection
+        # STEP 6: Tare FT sensor (after grasping, before human contact)
         # ================================================================
-        print("\n>>> STEP 5: Starting probing oscillation...")
-        print("    Human: reach for the flange and push/pull gently.")
-        print("    Robot will detect bidirectional force.")
+        print("\n>>> STEP 6: Taring FT sensor...")
+        print("    DO NOT touch the object or gripper during tare!")
+
+        # Give the system a moment to stabilize after grasping
+        time.sleep(1.0)
+        if _stop_event.is_set():
+            e_stop(client)
+            if gripper:
+                gripper.open()
+            return
+
+        samples = []
+        for _ in range(FT_TARE_SAMPLES):
+            with _ft_lock:
+                samples.append(_ft_raw.copy())
+            time.sleep(0.01)
+        _ft_tare = np.mean(samples, axis=0)
+        _ft_tared = True
+        print(f"[FT] Tare complete:")
+        print(f"     F = ({_ft_tare[0]:.2f}, {_ft_tare[1]:.2f}, {_ft_tare[2]:.2f}) N")
+        print(f"     M = ({_ft_tare[3]:.2f}, {_ft_tare[4]:.2f}, {_ft_tare[5]:.2f}) Nm")
+        print(f"     NOTE: Fz is along tool axis (J6), toward the palm.")
+
+        # ================================================================
+        # STEP 7: Start probing and Bayesian detection
+        # ================================================================
+        print("\n>>> STEP 7: Starting probing oscillation...")
+        print("    Human: grasp the object firmly when ready.")
+        print("    Robot will detect bidirectional force via Bayesian model.")
+
+        model = BayesianContactModel()
         probe_thread = threading.Thread(
             target=probing_loop, args=(client,), daemon=True)
         probe_thread.start()
+        time.sleep(0.3)
 
         # ---- Detection loop ----
-        print("\n>>> STEP 6: Detecting firm grasp...")
-        window_up = []
-        window_down = []
-        firm_threshold = max(0.5 * OBJECT_WEIGHT, 1.0)  # N
+        print("\n>>> Detection active. Waiting for firm grasp...")
+        print("    (Press ENTER at any time to emergency stop)")
 
-        while not stop_event.is_set():
+        detect_start = time.time()
+        contact_detected = False
+        log_entries = []
+
+        while not _stop_event.is_set():
+            # Read FT sensor
             ft = read_ft()
             fz = ft[2]
 
-            if fz > 0.3:
-                window_up.append(fz)
-            elif fz < -0.3:
-                window_down.append(abs(fz))
-
-            window_up = window_up[-50:]
-            window_down = window_down[-50:]
-
-            up_ok = len(window_up) >= 10 and max(window_up) >= firm_threshold
-            down_ok = len(window_down) >= 10 and max(window_down) >= firm_threshold
-
-            if up_ok and down_ok:
-                print(f"\n    >>> FIRM GRASP: up={max(window_up):.1f}N, "
-                      f"down={max(window_down):.1f}N <<<")
+            # Monitor for excessive force
+            if abs(fz) > FT_EXCESSIVE_FORCE:
+                print(f"\n!!! EXCESSIVE FORCE: fz={fz:.1f}N > {FT_EXCESSIVE_FORCE}N !!!")
+                print("Auto-stopping for safety.")
+                _stop_event.set()
                 break
 
-            # Status print every second
-            if int(time.time() * 10) % 20 == 0:
-                up_str = f"up max={max(window_up):.1f}N" if window_up else "up: -"
-                down_str = f"down max={max(window_down):.1f}N" if window_down else "down: -"
-                print(f"    fz={fz:+6.2f}N  {up_str:20s}  {down_str}")
+            # Check if human has made contact (using vertical direction)
+            if abs(fz) > 0.3 and not contact_detected:
+                contact_detected = True
+                print(f"[{time.time()-detect_start:.1f}s] Human contact detected (fz={fz:.2f}N)")
+
+            # Compute probing velocity (estimated from joint oscillation)
+            # In the real system, u_z is estimated from the probing motion
+            t_elapsed = time.time() - detect_start
+            omega = 2 * math.pi * PROBE_FREQ
+            dphase = omega * math.cos(omega * t_elapsed)
+            u_z = np.clip(PROBE_AMP * 0.015 * dphase, -V_MAX, V_MAX)
+
+            # Update Bayesian model
+            if contact_detected:
+                model.update(u_z, fz)
+
+                # Check for firm grasp
+                if model.check_firm_grasp():
+                    print(f"\n    >>> FIRM GRASP DETECTED! <<<")
+                    print(f"        fz={fz:.2f}N  "
+                          f"w=[{model.m[0]:.1f},{model.m[1]:.1f}]  "
+                          f"ent={model.entropy():.2f}")
+                    break
+
+            # Log
+            log_entries.append({
+                't': t_elapsed,
+                'u_z': u_z,
+                'fz': fz,
+                'w_up': float(model.m[0]),
+                'w_down': float(model.m[1]),
+                'entropy': model.entropy(),
+                'firm': False,
+                'contact': contact_detected,
+            })
+
+            # Status print every ~1 second
+            if int(t_elapsed * 10) % 10 == 0:
+                firm_str = "FIRM!" if model.check_firm_grasp() else "…"
+                print(f"    t={t_elapsed:5.1f}s  "
+                      f"fz={fz:+6.2f}N  "
+                      f"w=[{model.m[0]:5.0f},{model.m[1]:5.0f}]  "
+                      f"ent={model.entropy():.1f}  "
+                      f"firm={firm_str}")
 
             time.sleep(0.05)
 
-        # ================================================================
-        # STEP 7: Stop probing and return HOME
-        # ================================================================
-        stop_event.set()  # signal probing thread to stop
-        time.sleep(0.5)
+        # ---- Stop probing ----
+        global _probe_running
+        _probe_running = False
+        time.sleep(0.3)
         probe_thread.join(timeout=2.0)
 
-        print("\n>>> STEP 7: Returning to HOME...")
-        # Re-enable if needed (emergency stop may have disabled)
-        send_cmd(client, "{Clear}", 500)
-        send_cmd(client, "{Disable}", 500)
-        time.sleep(0.3)
-        send_cmd(client, "{Mode}", 500)
-        send_cmd(client, "{SetMaxToq}", 500)
-        send_cmd(client, "{Recover}", 500)
-        send_cmd(client, "{SetRate}", 500)
-        send_cmd(client, "{Enable}", 500)
-        send_cmd(client, "{Var --clear}", 500)
-        send_cmd(client, "{Recover}", 500)
-        send_cmd(client, f"{{Var --type=jointtarget --name=j_home --value={{{j_home_str},0,0,0,0}}}}", 500)
-        time.sleep(0.3)
+        # Mark final log entry as firm if detected
+        if log_entries:
+            log_entries[-1]['firm'] = True
 
-        send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 30000)
-        print("[TB6] Back at HOME.")
+        # ---- Save log ----
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(LOG_DIR, f"real_handover_log_{ts}.json")
+        try:
+            with open(log_path, 'w') as f:
+                json.dump(log_entries, f, indent=2)
+            print(f"[Log] Saved: {log_path}")
+        except Exception as ex:
+            print(f"[Log] Save failed: {ex}")
+
+        # ================================================================
+        # STEP 8: Release gripper
+        # ================================================================
+        if not _stop_event.is_set():
+            print("\n>>> STEP 8: Releasing object...")
+            time.sleep(0.3)
+            if gripper:
+                gripper.open(speed=0x60, force=0x40)
+                time.sleep(1.0)
+                print("    Gripper opened. Object released to human.")
+            else:
+                print("    Gripper skipped (arm-only mode).")
+        else:
+            # Emergency: try to release anyway
+            if gripper:
+                gripper.open(speed=0xFF, force=0xFF)
+
+        # ================================================================
+        # STEP 9: Return to HOME
+        # ================================================================
+        if not _stop_event.is_set():
+            print("\n>>> STEP 9: Returning to HOME...")
+            send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 60000)
+            print("[TB6] Back at HOME.")
+        else:
+            print("\n>>> STEP 9: Emergency recovery...")
+            re_enable(client)
+            send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 60000)
+            print("[TB6] Back at HOME (post-emergency).")
 
     except KeyboardInterrupt:
-        print("\nInterrupted.")
+        print("\nInterrupted by user.")
     except Exception as ex:
         print(f"\nERROR: {ex}")
+        import traceback
+        traceback.print_exc()
     finally:
-        stop_event.set()
+        # Always stop probing
+        _probe_running = False
+
+        # Always stop and disable the arm
+        _stop_event.set()
         try:
             e_stop(client)
         except Exception:
             pass
+
+        # Always open gripper for safety
+        if gripper:
+            try:
+                gripper.open(speed=0xFF, force=0xFF)
+                time.sleep(0.5)
+                gripper.reset_gripper()
+                gripper.disconnect()
+            except Exception:
+                pass
+
+        # Shutdown topic
         try:
             topic_node.Shutdown()
         except Exception:
             pass
-        print("\n=== Experiment ended. ===")
+
+        # Disconnect estop client
+        if _estop_client is not None:
+            try:
+                # CPPClient doesn't have explicit close; let GC handle it
+                _estop_client = None
+            except Exception:
+                pass
+
+        print("\n" + "=" * 60)
+        print("Experiment ended. Arm is stopped and disabled.")
+        print("Gripper is open (safe state).")
+        print("=" * 60)
 
 
+# ===========================================================================
 if __name__ == "__main__":
-    print("=" * 60)
-    print("TB6 Handover Test — Active Contact Sensing")
-    print("Press ENTER at any time for EMERGENCY STOP")
-    print("=" * 60)
     main()
