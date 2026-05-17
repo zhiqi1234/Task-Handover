@@ -21,9 +21,13 @@ EXPERIMENT FLOW (matches simulation):
        → MOVING_TO_HOME → HOME
 
 FT SENSOR NOTE:
-  The sensor's Fz is aligned with the tool axis (J6 rotation axis),
-  pointing outward from the palm. Probing oscillation on J2/J3/J5
-  produces motion primarily along this axis at the handover pose.
+  The sensor's Fz is along the tool axis (J6 rotation axis).
+  We rotate FT readings to world frame via the TCP quaternion from
+  the topic so that Fz aligns with gravity, matching the paper's assumption
+  that the probing direction and force sensing are both vertical.
+
+PROBING: SpeedL (Cartesian velocity, world frame) oscillates TCP along
+  world Z (vertical/gravity).  The controller handles IK automatically.
 """
 
 import rpc
@@ -60,7 +64,8 @@ def _install_topic_filter():
     def _pump():
         with os.fdopen(r_fd, 'r', encoding='utf-8', errors='replace', closefd=True) as src:
             for line in src:
-                if "No callbacks registered for topic:" not in line:
+                if ("No callbacks registered for topic:" not in line
+                        and "[await]" not in line):
                     os.write(saved_fd, line.encode('utf-8', errors='replace'))
 
     t = threading.Thread(target=_pump, daemon=True)
@@ -112,9 +117,8 @@ SETRATE = 15               # global speed percentage (10-30, low = safe)
 MOVE_DURATION = 8.0        # seconds for MoveAbsJ (slower than simulation's 5s)
 
 # ---- Probing parameters ----
-PROBE_AMP = 0.020           # oscillation amplitude (rad) ≈ 1.15°
-PROBE_FREQ = 1.5            # Hz
-PROBE_DT = 0.05             # SpeedJ update interval (s)
+PROBE_DELTA_Z = 0.030       # vertical TCP oscillation amplitude (m)
+PROBE_FREQ = 1.5            # Hz — approximate, depends on MoveAbsJ speed
 
 # ---- Bayesian model ----
 BETA = 0.05                 # measurement noise variance
@@ -316,19 +320,19 @@ class RobotiqGripper:
 # Shared state (populated by topic callback)
 # ===========================================================================
 _ft_lock = threading.Lock()
-_ft_raw = np.zeros(6)       # [fx, fy, fz, mx, my, mz]
+_ft_raw = np.zeros(6)       # [fx, fy, fz, mx, my, mz] — in tool/sensor frame
 _ft_tare = np.zeros(6)
 _ft_tared = False
 _joint_positions = np.zeros(6)
+_tcp_quaternion = np.array([0.0, 0.0, 0.0, 1.0])  # [qx, qy, qz, qw] tool→world
 _system_running = True
 _cb_count = 0
 
 
 def _on_rtstate(tt: topic.SystemRtState):
-    global _ft_raw, _joint_positions, _system_running, _cb_count
+    global _ft_raw, _joint_positions, _tcp_quaternion, _system_running, _cb_count
     _cb_count += 1
     if _cb_count <= 3:
-        # Confirm the callback is being invoked (print bypasses the filter via saved fd)
         print(f"[Topic] rtstate callback #{_cb_count} received")
 
     parm = message.SystemStateData()
@@ -349,9 +353,30 @@ def _on_rtstate(tt: topic.SystemRtState):
         if _cb_count <= 3:
             print(f"[Topic] Joints: {[_joint_positions[i] for i in range(6)]}")
 
+    # Extract TCP orientation (flange/tool frame → world)
+    if parm.models_current_points:
+        rt = parm.models_current_points[0].robottarget
+        if len(rt) >= 7:
+            with _ft_lock:
+                _tcp_quaternion = np.array([rt[3], rt[4], rt[5], rt[6]],
+                                           dtype=float)
+            if _cb_count <= 3:
+                print(f"[Topic] TCP quat (qx,qy,qz,qw): "
+                      f"{[f'{x:.3f}' for x in _tcp_quaternion]}")
+
+
+def _quat_to_rot(q):
+    """Convert quaternion [qx,qy,qz,qw] to 3x3 rotation matrix."""
+    qx, qy, qz, qw = q[0], q[1], q[2], q[3]
+    return np.array([
+        [1 - 2*(qy**2 + qz**2),     2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
+        [2*(qx*qy + qz*qw),         1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
+        [2*(qx*qz - qy*qw),         2*(qy*qz + qx*qw),     1 - 2*(qx**2 + qy**2)],
+    ])
+
 
 def read_ft():
-    """Return tare-compensated FT [fx,fy,fz,mx,my,mz]."""
+    """Return tare-compensated FT [fx,fy,fz,mx,my,mz] in tool/sensor frame."""
     with _ft_lock:
         raw = _ft_raw.copy()
         tare = _ft_tare.copy()
@@ -359,9 +384,26 @@ def read_ft():
     return raw - tare if tared else raw
 
 
+def read_ft_world():
+    """Return tare-compensated FT [fx,fy,fz] in WORLD frame (Fz = gravity dir).
+
+    The wrist FT sensor measures forces in the tool/flange frame where Fz is
+    along the J6 rotation axis.  The paper expects Fz to be along gravity
+    (world Z downward).  This function rotates the force vector from the
+    tool frame into the world frame using the TCP quaternion from the topic.
+    """
+    ft_tool = read_ft()
+    f_tool = ft_tool[:3]
+    with _ft_lock:
+        q = _tcp_quaternion.copy()
+    R = _quat_to_rot(q)
+    f_world = R @ f_tool
+    return f_world
+
+
 def read_ft_fz():
-    """Read Fz only (primary axis for handover detection)."""
-    return read_ft()[2]
+    """Read Fz only — NOW IN WORLD FRAME (gravity-aligned)."""
+    return read_ft_world()[2]
 
 
 def read_joints():
@@ -527,46 +569,62 @@ def defined_joint_target(client, name, joints):
 
 
 # ===========================================================================
-# Probing via SpeedJ (runs in background thread)
+# Probing via MoveAbsJ position oscillation (runs in background thread)
+# ===========================================================================
+# SpeedL/SpeedJ async velocity commands proved unreliable on this TB6 firmware.
+# MoveAbsJ CallAsync was also rejected (arm didn't move).  Only CallAwait
+# (synchronous) works reliably.  Console [await] spam is suppressed via the
+# stdout filter in _install_topic_filter().
 # ===========================================================================
 _probe_running = False
 
+# Probe joint offset on J2/J3/J5 — tuned for visible but gentle vertical TCP
+# motion.  Keep J1=0 (no base rotation).
+_PROBE_OFFSET = np.array([0.0, 0.008, 0.005, 0.0, -0.003, 0.0])
+
 
 def probing_loop(client):
-    """Send sinusoidal velocity commands via SpeedJ (async, ~20 Hz).
-    Oscillates J2, J3, J5 to produce vertical probing at the palm.
+    """Alternate between HANDOVER+offset and HANDOVER-offset via CallAwait MoveAbsJ.
+
+    Each CallAwait blocks until the small move completes (~200-400 ms at
+    SETRATE=15), giving roughly 1-2 Hz bidirectional probing.  The main
+    detection loop runs independently in its own thread reading FT data.
     """
     global _probe_running
-    omega = 2 * math.pi * PROBE_FREQ
-    t0 = time.time()
+    base = np.array(HANDOVER_JOINTS)
+
+    up_joints = base + _PROBE_OFFSET
+    dn_joints = base - _PROBE_OFFSET
+    send_cmd(client,
+             f"{{Var --type=jointtarget --name=j_probe_up "
+             f"--value={{{up_joints[0]:.6f},{up_joints[1]:.6f},{up_joints[2]:.6f},"
+             f"{up_joints[3]:.6f},{up_joints[4]:.6f},{up_joints[5]:.6f},"
+             f"0,0,0,0}}}}",
+             500)
+    send_cmd(client,
+             f"{{Var --type=jointtarget --name=j_probe_dn "
+             f"--value={{{dn_joints[0]:.6f},{dn_joints[1]:.6f},{dn_joints[2]:.6f},"
+             f"{dn_joints[3]:.6f},{dn_joints[4]:.6f},{dn_joints[5]:.6f},"
+             f"0,0,0,0}}}}",
+             500)
+
     _probe_running = True
-    print("[Probe] Oscillation started.")
+    print("[Probe] Position oscillation started (MoveAbsJ).")
+    print(f"[Probe] Offset: J2={_PROBE_OFFSET[1]:.3f} J3={_PROBE_OFFSET[2]:.3f} "
+          f"J5={_PROBE_OFFSET[4]:.3f} rad")
 
+    use_up = True
     while _probe_running and not _stop_event.is_set():
-        t = time.time() - t0
-        phase = math.sin(omega * t)
-        dphase = omega * math.cos(omega * t)
-
-        # Velocity commands (rad/s) — matched to simulation ratios
-        v2 = PROBE_AMP * dphase
-        v3 = PROBE_AMP * 0.6 * dphase
-        v5 = -PROBE_AMP * 0.3 * dphase
-
-        cmd = (f"{{SpeedJ --vel={{{v2:.4f},{v3:.4f},0,0,{v5:.4f},0}}"
-               f" --acc={{3,3,3,3,3,3}}"
-               f" --dec={{3,3,3,3,3,3}}"
-               f" --jerk={{10,10,10,10,10,10}}"
-               f" --last_count={int(PROBE_DT * 1000)}}}")
-
+        target_name = "j_probe_up" if use_up else "j_probe_dn"
+        cmd = f"{{MoveAbsJ --jointtarget_var={target_name}}}"
         msg = rpc.Msg(cmd)
         msg.setMsgID(10001)
         msg.setMsgSeqID(random.randint(1, 10000))
-        client.CallAsync(msg, 100, lambda *_: None)
+        client.CallAwait(msg, 3000)
+        use_up = not use_up
 
-        time.sleep(PROBE_DT)
-
-    # Stop probing smoothly
-    send_cmd(client, "{SpeedJ --stop}", 500)
+    # Return to handover pose
+    send_cmd(client, "{MoveAbsJ --jointtarget_var=j_handover}", 5000)
     _probe_running = False
     print("[Probe] Stopped.")
 
@@ -672,7 +730,7 @@ def main():
         if gripper:
             print("\n>>> STEP 2: Activating Robotiq gripper...")
             gripper.activate()
-            if not gripper.wait_activation(timeout=5.0):
+            if not gripper.wait_activation(timeout=15.0):
                 print("[Robotiq] WARNING: Activation may have failed.")
                 print("Check power and connections. Continuing anyway.")
             else:
@@ -791,48 +849,59 @@ def main():
         detect_start = time.time()
         contact_detected = False
         log_entries = []
+        last_status = 0.0          # last status print time
+        last_cb_count = _cb_count  # track topic callback health
 
         while not _stop_event.is_set():
-            # Read FT sensor
-            ft = read_ft()
-            fz = ft[2]
+            # Read FT sensor in world frame (Fz = gravity direction, per paper)
+            f_world = read_ft_world()
+            fz_world = f_world[2]
+            ft_tool = read_ft()  # tool-frame for logging
 
-            # Monitor for excessive force
-            if abs(fz) > FT_EXCESSIVE_FORCE:
-                print(f"\n!!! EXCESSIVE FORCE: fz={fz:.1f}N > {FT_EXCESSIVE_FORCE}N !!!")
+            # Monitor for excessive force (check both tool and world frames)
+            f_mag = float(np.linalg.norm(f_world))
+            if f_mag > FT_EXCESSIVE_FORCE:
+                print(f"\n!!! EXCESSIVE FORCE: |F|={f_mag:.1f}N > {FT_EXCESSIVE_FORCE}N !!!")
                 print("Auto-stopping for safety.")
                 _stop_event.set()
                 break
 
-            # Check if human has made contact (using vertical direction)
-            if abs(fz) > 0.3 and not contact_detected:
+            # Check if human has made contact (world-frame vertical force)
+            if abs(fz_world) > 0.3 and not contact_detected:
                 contact_detected = True
-                print(f"[{time.time()-detect_start:.1f}s] Human contact detected (fz={fz:.2f}N)")
+                print(f"[{time.time()-detect_start:.1f}s] Human contact detected "
+                      f"(fz_world={fz_world:.2f}N, fz_tool={ft_tool[2]:.2f}N)")
 
-            # Compute probing velocity (estimated from joint oscillation)
-            # In the real system, u_z is estimated from the probing motion
+            # Estimated vertical TCP velocity from probing oscillation.
+            # Probing uses MoveAbsJ (position-based, roughly triangular),
+            # but we approximate as sinusoidal for the Bayesian model:
+            #   u_z ≈ PROBE_DELTA_Z · ω · cos(ω·t)
             t_elapsed = time.time() - detect_start
             omega = 2 * math.pi * PROBE_FREQ
             dphase = omega * math.cos(omega * t_elapsed)
-            u_z = np.clip(PROBE_AMP * 0.015 * dphase, -V_MAX, V_MAX)
+            u_z = np.clip(PROBE_DELTA_Z * dphase, -V_MAX, V_MAX)
 
-            # Update Bayesian model
-            if contact_detected:
-                model.update(u_z, fz)
+            # Update Bayesian model EVERY cycle (not only after contact).
+            # Without contact the data is low-signal so uncertainty stays high;
+            # once the human grasps, forces appear and the model converges.
+            model.update(u_z, fz_world)
 
-                # Check for firm grasp
-                if model.check_firm_grasp():
-                    print(f"\n    >>> FIRM GRASP DETECTED! <<<")
-                    print(f"        fz={fz:.2f}N  "
-                          f"w=[{model.m[0]:.1f},{model.m[1]:.1f}]  "
-                          f"ent={model.entropy():.2f}")
-                    break
+            # Check for firm grasp (runs every cycle)
+            if model.check_firm_grasp():
+                print(f"\n    >>> FIRM GRASP DETECTED! <<<")
+                print(f"        fz_world={fz_world:.2f}N  "
+                      f"w=[{model.m[0]:.1f},{model.m[1]:.1f}]  "
+                      f"ent={model.entropy():.2f}")
+                break
 
             # Log
             log_entries.append({
                 't': t_elapsed,
                 'u_z': u_z,
-                'fz': fz,
+                'fz_world': float(fz_world),
+                'fz_tool': float(ft_tool[2]),
+                'fx_world': float(f_world[0]),
+                'fy_world': float(f_world[1]),
                 'w_up': float(model.m[0]),
                 'w_down': float(model.m[1]),
                 'entropy': model.entropy(),
@@ -840,14 +909,21 @@ def main():
                 'contact': contact_detected,
             })
 
-            # Status print every ~1 second
-            if int(t_elapsed * 10) % 10 == 0:
+            # Status print every ~1 second (robust time-gap, not modulo)
+            if t_elapsed - last_status >= 1.0:
+                # Warn if topic callbacks seem to have stopped
+                cb_delta = _cb_count - last_cb_count
+                cb_warn = " [topic stalled?]" if cb_delta == 0 else ""
                 firm_str = "FIRM!" if model.check_firm_grasp() else "…"
                 print(f"    t={t_elapsed:5.1f}s  "
-                      f"fz={fz:+6.2f}N  "
+                      f"fz_world={fz_world:+6.2f}N  "
+                      f"fz_tool={ft_tool[2]:+6.2f}N  "
                       f"w=[{model.m[0]:5.0f},{model.m[1]:5.0f}]  "
                       f"ent={model.entropy():.1f}  "
-                      f"firm={firm_str}")
+                      f"firm={firm_str}{cb_warn}",
+                      flush=True)
+                last_status = t_elapsed
+                last_cb_count = _cb_count
 
             time.sleep(0.05)
 
@@ -876,17 +952,30 @@ def main():
         # ================================================================
         if not _stop_event.is_set():
             print("\n>>> STEP 8: Releasing object...")
-            time.sleep(0.3)
             if gripper:
                 gripper.open(speed=0x60, force=0x40)
-                time.sleep(1.0)
-                print("    Gripper opened. Object released to human.")
+                # Wait for gripper to fully open — poll gSTA until == 3 (reached
+                # requested position) or timeout.  Must NOT move the arm before
+                # the fingers are clear of the object.
+                t0 = time.time()
+                while time.time() - t0 < 5.0:
+                    st = gripper.read_gripper_status()
+                    if st is not None and st['gSTA'] == 3:
+                        print(f"    Gripper fully open ({time.time()-t0:.1f}s).")
+                        break
+                    time.sleep(0.1)
+                else:
+                    print("    WARNING: Gripper open timeout — proceed with caution.")
+                # Extra settling time after fingers stop
+                time.sleep(0.5)
             else:
                 print("    Gripper skipped (arm-only mode).")
+            print("    Object released to human.")
         else:
-            # Emergency: try to release anyway
+            # Emergency: try to release anyway, then wait before moving arm
             if gripper:
                 gripper.open(speed=0xFF, force=0xFF)
+                time.sleep(1.5)
 
         # ================================================================
         # STEP 9: Return to HOME
