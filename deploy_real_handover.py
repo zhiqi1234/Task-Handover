@@ -12,7 +12,7 @@ SAFETY (read before operating):
   - Move duration: 8s (slower than simulation for safety)
 
 PREREQUISITES:
-  pip install pyserial numpy
+  pip install pyserial numpy scipy
 
 EXPERIMENT FLOW (matches simulation):
   HOME → MOVING_TO_POSE → READY → GRASPING (close Robotiq)
@@ -36,10 +36,45 @@ import math
 import os
 import json
 import struct
+import os
+import sys
 from collections import deque
 from datetime import datetime
 
 import numpy as np
+
+
+def _install_topic_filter():
+    """Redirect C stdout (fd 1) through a pipe to suppress C++ topic log spam.
+    Python output is routed directly to the original stdout, bypassing the filter.
+    Returns (saved_fd, filter_thread).
+    """
+    saved_fd = os.dup(1)           # save original stdout
+    r_fd, w_fd = os.pipe()         # create pipe
+    os.dup2(w_fd, 1)               # C stdout now writes to pipe
+    os.close(w_fd)
+
+    # Route Python stdout directly to the real console (bypasses the pipe/filter)
+    sys.stdout = os.fdopen(os.dup(saved_fd), 'w', buffering=1, closefd=False)
+
+    def _pump():
+        with os.fdopen(r_fd, 'r', encoding='utf-8', errors='replace', closefd=True) as src:
+            for line in src:
+                if "No callbacks registered for topic:" not in line:
+                    os.write(saved_fd, line.encode('utf-8', errors='replace'))
+
+    t = threading.Thread(target=_pump, daemon=True)
+    t.start()
+    return saved_fd, t
+
+
+def _restore_topic_filter(saved_fd):
+    """Restore original stdout fd."""
+    sys.stdout.flush()
+    sys.stdout.close()
+    os.dup2(saved_fd, 1)
+    os.close(saved_fd)
+    sys.stdout = os.fdopen(os.dup(1), 'w', buffering=1, closefd=False)
 
 # ===========================================================================
 # Configuration — ADJUST THESE TO MATCH YOUR SETUP
@@ -49,9 +84,9 @@ TB6_PORT = 5868
 TOPIC_PORT = 19091
 
 # Robotiq gripper — Modbus RTU (RS232)
-# Set ROBOTIQ_PORT to your COM port, e.g. "COM3" on Windows, "/dev/ttyUSB0" on Linux
+# Set ROBOTIQ_PORT to your COM port, e.g. "COM12" on Windows, "/dev/ttyUSB0" on Linux
 # Set ROBOTIQ_PORT = None to run WITHOUT gripper (arm-only test mode)
-ROBOTIQ_PORT = None          # e.g. "COM3"
+ROBOTIQ_PORT = "COM12"          # e.g. "COM12"
 ROBOTIQ_SLAVE_ID = 9
 ROBOTIQ_BAUDRATE = 115200
 
@@ -77,7 +112,7 @@ SETRATE = 15               # global speed percentage (10-30, low = safe)
 MOVE_DURATION = 8.0        # seconds for MoveAbsJ (slower than simulation's 5s)
 
 # ---- Probing parameters ----
-PROBE_AMP = 0.006           # oscillation amplitude (rad), half of simulation
+PROBE_AMP = 0.020           # oscillation amplitude (rad) ≈ 1.15°
 PROBE_FREQ = 1.5            # Hz
 PROBE_DT = 0.05             # SpeedJ update interval (s)
 
@@ -93,7 +128,7 @@ FT_EXCESSIVE_FORCE = 50.0   # N — auto-stop if exceeded
 V_MAX = 0.04                # max gripper velocity (m/s), for firm-grasp check
 
 # ---- Logging ----
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -286,10 +321,16 @@ _ft_tare = np.zeros(6)
 _ft_tared = False
 _joint_positions = np.zeros(6)
 _system_running = True
+_cb_count = 0
 
 
 def _on_rtstate(tt: topic.SystemRtState):
-    global _ft_raw, _joint_positions, _system_running
+    global _ft_raw, _joint_positions, _system_running, _cb_count
+    _cb_count += 1
+    if _cb_count <= 3:
+        # Confirm the callback is being invoked (print bypasses the filter via saved fd)
+        print(f"[Topic] rtstate callback #{_cb_count} received")
+
     parm = message.SystemStateData()
     message.display_rt(tt, parm)
 
@@ -297,12 +338,16 @@ def _on_rtstate(tt: topic.SystemRtState):
         ft = parm.controller.ftvalues[0]
         with _ft_lock:
             _ft_raw = np.array([ft.fx, ft.fy, ft.fz, ft.mx, ft.my, ft.mz])
+        if _cb_count <= 3:
+            print(f"[Topic] FT raw: fx={ft.fx:.2f} fy={ft.fy:.2f} fz={ft.fz:.2f}")
 
     joints_per_model = len(parm.models_joints) // max(len(parm.models), 1)
     if joints_per_model >= 6:
         with _ft_lock:
             for j in range(6):
                 _joint_positions[j] = parm.models_joints[j].position
+        if _cb_count <= 3:
+            print(f"[Topic] Joints: {[_joint_positions[i] for i in range(6)]}")
 
 
 def read_ft():
@@ -383,28 +428,26 @@ class BayesianContactModel:
 # TB6 RPC utilities
 # ===========================================================================
 _stop_event = threading.Event()
-_estop_client = None  # dedicated RPC client for emergency-stop thread
 
 
-def _estop_listener():
-    """ENTER key → immediate Stop+Disable via dedicated RPC connection.
-    Having its own client means estop works even when the main thread
-    is blocked inside CallAwait for a long-running MoveAbsJ.
+def _estop_listener(client):
+    """ENTER key → immediate Stop+Disable.
+    Shares the main RPC client — may be delayed if main thread is
+    inside a blocking CallAwait, but the stop flag is set immediately.
     """
     input()
     _stop_event.set()
     print("\n>>> EMERGENCY STOP TRIGGERED <<<")
-    if _estop_client is not None:
-        try:
-            for cmd in ["{Stop}", "{Disable}"]:
-                msg = rpc.Msg(cmd)
-                msg.setMsgID(10001)
-                msg.setMsgSeqID(random.randint(1, 10000))
-                _estop_client.CallAwait(msg, 3000)
-            print(">>> Arm stopped via dedicated estop channel.")
-        except Exception as ex:
-            print(f">>> Estop send error: {ex}")
-            print(">>> USE PHYSICAL ESTOP BUTTON if arm is still moving!")
+    try:
+        for cmd in ["{Stop}", "{Disable}"]:
+            msg = rpc.Msg(cmd)
+            msg.setMsgID(10001)
+            msg.setMsgSeqID(random.randint(1, 10000))
+            client.CallAwait(msg, 3000)
+        print(">>> Arm stopped via estop.")
+    except Exception as ex:
+        print(f">>> Estop send error: {ex}")
+        print(">>> USE PHYSICAL ESTOP BUTTON if arm is still moving!")
 
 
 def send_cmd(client, cmd_str, timeout_ms=500):
@@ -450,7 +493,7 @@ def e_stop(client):
 
 
 def re_enable(client):
-    """Re-enable arm after estop (Clear → Disable → Mode → ... → Enable)."""
+    """Re-enable arm after estop (Clear → Disable → Mode → ... → Start)."""
     init_cmds = [
         "{Clear}",
         "{Disable}",
@@ -461,6 +504,7 @@ def re_enable(client):
         "{Enable}",
         "{Var --clear}",
         "{Recover}",
+        "{Start}",
     ]
     return send_cmds(client, init_cmds, 500, 0.1)
 
@@ -517,7 +561,7 @@ def probing_loop(client):
         msg = rpc.Msg(cmd)
         msg.setMsgID(10001)
         msg.setMsgSeqID(random.randint(1, 10000))
-        client.CallAsync(msg, 100)
+        client.CallAsync(msg, 100, lambda *_: None)
 
         time.sleep(PROBE_DT)
 
@@ -545,11 +589,11 @@ def main():
         print("        Robotiq gripper: DISABLED (arm-only test mode)")
     print("=" * 60)
 
-    # ---- Create dedicated estop RPC client & start listener ----
-    global _estop_client
-    _estop_client = rpc.CPPClient(TB6_IP, TB6_PORT)
-    print("[Safety] Dedicated estop client connected.")
-    listener = threading.Thread(target=_estop_listener, daemon=True)
+    # ---- Connect RPC (single client, shared with estop) ----
+    print(f"\n[RPC] Connecting to {TB6_IP}:{TB6_PORT}...")
+    client = rpc.CPPClient(TB6_IP, TB6_PORT)
+    print("[RPC] Client created. Starting estop listener...")
+    listener = threading.Thread(target=_estop_listener, args=(client,), daemon=True)
     listener.start()
 
     # ---- Connect topic (FT sensor + joint state) ----
@@ -561,14 +605,12 @@ def main():
     if not topic_node.Start():
         print("FATAL: Failed to start topic node")
         return
-    topic_node.CreateSubscriptionRT("system_rtstate", _on_rtstate)
+    _rt_sub = topic_node.CreateSubscriptionRT("system_rtstate", _on_rtstate)
     print("[Topic] Subscribed.")
     time.sleep(1.0)
 
-    # ---- Connect RPC ----
-    print(f"\n[RPC] Connecting to {TB6_IP}:{TB6_PORT}...")
-    client = rpc.CPPClient(TB6_IP, TB6_PORT)
-    print("[RPC] Connected!")
+    # Suppress C++ topic layer "No callbacks registered" log spam
+    _saved_fd, _filter_thread = _install_topic_filter()
 
     # ---- Connect Robotiq gripper (if configured) ----
     gripper = None
@@ -597,6 +639,7 @@ def main():
             "{Enable}",
             "{Var --clear}",
             "{Recover}",
+            "{Start}",
         ]
         if not send_cmds(client, init_cmds, 500, 0.1):
             e_stop(client)
@@ -646,7 +689,11 @@ def main():
         # STEP 3: Move to HOME position
         # ================================================================
         print("\n>>> STEP 3: Moving to HOME position...")
-        send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 60000)
+        status, _ = send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 60000)
+        if status != 0:
+            print("[ERROR] MoveAbsJ to HOME failed!")
+            e_stop(client)
+            return
         if _stop_event.is_set():
             e_stop(client)
             return
@@ -664,7 +711,11 @@ def main():
             e_stop(client)
             return
 
-        send_cmd(client, "{MoveAbsJ --jointtarget_var=j_handover}", 60000)
+        status, _ = send_cmd(client, "{MoveAbsJ --jointtarget_var=j_handover}", 60000)
+        if status != 0:
+            print("[ERROR] MoveAbsJ to HANDOVER failed!")
+            e_stop(client)
+            return
         if _stop_event.is_set():
             e_stop(client)
             return
@@ -676,8 +727,12 @@ def main():
         # ================================================================
         if gripper:
             print("\n>>> STEP 5: Closing gripper to grasp object...")
-            print("    (Place object in gripper now if not already there)")
-            time.sleep(1.0)
+            print("    Place object between gripper fingers NOW.")
+            print("    Gripper closes in:", end="", flush=True)
+            for i in range(3, 0, -1):
+                print(f" {i}", end="", flush=True)
+                time.sleep(1.0)
+            print()
             if _stop_event.is_set():
                 e_stop(client)
                 gripper.open()
@@ -838,13 +893,19 @@ def main():
         # ================================================================
         if not _stop_event.is_set():
             print("\n>>> STEP 9: Returning to HOME...")
-            send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 60000)
-            print("[TB6] Back at HOME.")
+            status, _ = send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 60000)
+            if status != 0:
+                print("[ERROR] MoveAbsJ to HOME failed!")
+            else:
+                print("[TB6] Back at HOME.")
         else:
             print("\n>>> STEP 9: Emergency recovery...")
             re_enable(client)
-            send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 60000)
-            print("[TB6] Back at HOME (post-emergency).")
+            status, _ = send_cmd(client, "{MoveAbsJ --jointtarget_var=j_home}", 60000)
+            if status != 0:
+                print("[ERROR] MoveAbsJ to HOME failed!")
+            else:
+                print("[TB6] Back at HOME (post-emergency).")
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
@@ -879,13 +940,9 @@ def main():
         except Exception:
             pass
 
-        # Disconnect estop client
-        if _estop_client is not None:
-            try:
-                # CPPClient doesn't have explicit close; let GC handle it
-                _estop_client = None
-            except Exception:
-                pass
+        # Restore stdout (undo topic log filter)
+        if '_saved_fd' in dir():
+            _restore_topic_filter(_saved_fd)
 
         print("\n" + "=" * 60)
         print("Experiment ended. Arm is stopped and disabled.")
