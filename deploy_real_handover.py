@@ -117,14 +117,14 @@ SETRATE = 15               # global speed percentage (10-30, low = safe)
 MOVE_DURATION = 8.0        # seconds for MoveAbsJ (slower than simulation's 5s)
 
 # ---- Probing parameters ----
-PROBE_DELTA_Z = 0.030       # vertical TCP oscillation amplitude (m)
-PROBE_FREQ = 1.5            # Hz — approximate, depends on MoveAbsJ speed
+# PROBE_DELTA_Z and PROBE_FREQ removed — u_z now comes from actual TCP velocity
+# via topic callback (robottarget position diff), not from synthetic sinusoid.
 
 # ---- Bayesian model ----
 BETA = 0.05                 # measurement noise variance
 CONFIDENCE_C = 0.99         # confidence level for firm-grasp check
 OBJECT_WEIGHT = 3.0         # N — measure your object's weight
-DATA_BUFFER_SIZE = 200      # most recent (u, f) pairs
+DATA_BUFFER_SIZE = 50       # most recent (u, f) pairs (paper: 200 @ 200Hz=1s; we: 50 @ 20Hz=2.5s)
 
 # ---- FT sensor ----
 FT_TARE_SAMPLES = 100       # samples for tare averaging
@@ -325,6 +325,11 @@ _ft_tare = np.zeros(6)
 _ft_tared = False
 _joint_positions = np.zeros(6)
 _tcp_quaternion = np.array([0.0, 0.0, 0.0, 1.0])  # [qx, qy, qz, qw] tool→world
+_tcp_pos_z_prev = 0.0
+_tcp_pos_z_curr = 0.0
+_tcp_time_prev = 0.0
+_tcp_time_curr = 0.0
+_tcp_vel_z = 0.0
 _system_running = True
 _cb_count = 0
 
@@ -353,13 +358,21 @@ def _on_rtstate(tt: topic.SystemRtState):
         if _cb_count <= 3:
             print(f"[Topic] Joints: {[_joint_positions[i] for i in range(6)]}")
 
-    # Extract TCP orientation (flange/tool frame → world)
+    # Extract TCP orientation (flange/tool frame → world) and Z velocity
     if parm.models_current_points:
         rt = parm.models_current_points[0].robottarget
         if len(rt) >= 7:
+            now = time.time()
             with _ft_lock:
                 _tcp_quaternion = np.array([rt[3], rt[4], rt[5], rt[6]],
                                            dtype=float)
+                _tcp_pos_z_prev = _tcp_pos_z_curr
+                _tcp_pos_z_curr = rt[2]
+                _tcp_time_prev = _tcp_time_curr
+                _tcp_time_curr = now
+                dt = _tcp_time_curr - _tcp_time_prev
+                if dt > 0.001 and _tcp_time_prev > 0:
+                    _tcp_vel_z = (_tcp_pos_z_curr - _tcp_pos_z_prev) / dt
             if _cb_count <= 3:
                 print(f"[Topic] TCP quat (qx,qy,qz,qw): "
                       f"{[f'{x:.3f}' for x in _tcp_quaternion]}")
@@ -404,6 +417,16 @@ def read_ft_world():
 def read_ft_fz():
     """Read Fz only — NOW IN WORLD FRAME (gravity-aligned)."""
     return read_ft_world()[2]
+
+
+def read_tcp_vel_z():
+    """Return latest TCP Z velocity (m/s) computed from topic callback positions.
+
+    Positive = TCP moving upward in world frame (opposite to gravity).
+    Returns 0.0 if no velocity estimate is available yet.
+    """
+    with _ft_lock:
+        return _tcp_vel_z
 
 
 def read_joints():
@@ -580,7 +603,7 @@ _probe_running = False
 
 # Probe joint offset on J2/J3/J5 — tuned for visible but gentle vertical TCP
 # motion.  Keep J1=0 (no base rotation).
-_PROBE_OFFSET = np.array([0.0, 0.008, 0.005, 0.0, -0.003, 0.0])
+_PROBE_OFFSET = np.array([0.0, 0.004, 0.003, 0.0, -0.002, 0.0])
 
 
 def probing_loop(client):
@@ -610,7 +633,7 @@ def probing_loop(client):
 
     _probe_running = True
     print("[Probe] Position oscillation started (MoveAbsJ).")
-    print(f"[Probe] Offset: J2={_PROBE_OFFSET[1]:.3f} J3={_PROBE_OFFSET[2]:.3f} "
+    print(f"[Probe] Offset (reduced): J2={_PROBE_OFFSET[1]:.3f} J3={_PROBE_OFFSET[2]:.3f} "
           f"J5={_PROBE_OFFSET[4]:.3f} rad")
 
     use_up = True
@@ -872,14 +895,11 @@ def main():
                 print(f"[{time.time()-detect_start:.1f}s] Human contact detected "
                       f"(fz_world={fz_world:.2f}N, fz_tool={ft_tool[2]:.2f}N)")
 
-            # Estimated vertical TCP velocity from probing oscillation.
-            # Probing uses MoveAbsJ (position-based, roughly triangular),
-            # but we approximate as sinusoidal for the Bayesian model:
-            #   u_z ≈ PROBE_DELTA_Z · ω · cos(ω·t)
+            # Actual TCP Z velocity from topic callback (robottarget position diff).
+            # Much more accurate than the old synthetic sinusoid — the model now
+            # fits real velocity → real force, matching the paper's assumption.
             t_elapsed = time.time() - detect_start
-            omega = 2 * math.pi * PROBE_FREQ
-            dphase = omega * math.cos(omega * t_elapsed)
-            u_z = np.clip(PROBE_DELTA_Z * dphase, -V_MAX, V_MAX)
+            u_z = np.clip(read_tcp_vel_z(), -V_MAX, V_MAX)
 
             # Update Bayesian model EVERY cycle (not only after contact).
             # Without contact the data is low-signal so uncertainty stays high;
