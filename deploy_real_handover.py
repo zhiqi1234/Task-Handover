@@ -121,7 +121,7 @@ MOVE_DURATION = 8.0        # seconds for MoveAbsJ (slower than simulation's 5s)
 # via topic callback (robottarget position diff), not from synthetic sinusoid.
 
 # ---- Bayesian model ----
-BETA = 0.05                 # measurement noise variance
+BETA = 0.01                 # measurement noise variance (lower = faster convergence)
 CONFIDENCE_C = 0.99         # confidence level for firm-grasp check
 OBJECT_WEIGHT = 3.0         # N — measure your object's weight
 DATA_BUFFER_SIZE = 50       # most recent (u, f) pairs (paper: 200 @ 200Hz=1s; we: 50 @ 20Hz=2.5s)
@@ -603,7 +603,7 @@ _probe_running = False
 
 # Probe joint offset on J2/J3/J5 — tuned for visible but gentle vertical TCP
 # motion.  Keep J1=0 (no base rotation).
-_PROBE_OFFSET = np.array([0.0, 0.004, 0.003, 0.0, -0.002, 0.0])
+_PROBE_OFFSET = np.array([0.0, 0.008, 0.005, 0.0, -0.003, 0.0])
 
 
 def probing_loop(client):
@@ -633,7 +633,7 @@ def probing_loop(client):
 
     _probe_running = True
     print("[Probe] Position oscillation started (MoveAbsJ).")
-    print(f"[Probe] Offset (reduced): J2={_PROBE_OFFSET[1]:.3f} J3={_PROBE_OFFSET[2]:.3f} "
+    print(f"[Probe] Offset: J2={_PROBE_OFFSET[1]:.3f} J3={_PROBE_OFFSET[2]:.3f} "
           f"J5={_PROBE_OFFSET[4]:.3f} rad")
 
     use_up = True
@@ -899,7 +899,8 @@ def main():
             # Much more accurate than the old synthetic sinusoid — the model now
             # fits real velocity → real force, matching the paper's assumption.
             t_elapsed = time.time() - detect_start
-            u_z = np.clip(read_tcp_vel_z(), -V_MAX, V_MAX)
+            raw_vel = read_tcp_vel_z()
+            u_z = np.clip(raw_vel, -V_MAX, V_MAX) if abs(raw_vel) > 0.001 else 0.0
 
             # Update Bayesian model EVERY cycle (not only after contact).
             # Without contact the data is low-signal so uncertainty stays high;

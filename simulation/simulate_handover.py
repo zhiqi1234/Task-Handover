@@ -324,6 +324,23 @@ def _multiply_pose(pos, orn, offset_pos, offset_orn):
     return p.multiplyTransforms(pos, orn, offset_pos, offset_orn)
 
 
+def _disable_body_collisions(body_id):
+    """Make a body non-colliding in the physics world.
+
+    The gripper and the two proxy bodies are visual / kinematic helpers only.
+    Leaving their collision shapes active can inject contact forces back into
+    the arm at the handover pose and show up as jitter.
+    """
+    for link_idx in range(-1, p.getNumJoints(body_id)):
+        p.setCollisionFilterGroupMask(body_id, link_idx, 0, 0)
+
+
+def _disable_body_pair_collisions(body_a, body_b):
+    for link_a in range(-1, p.getNumJoints(body_a)):
+        for link_b in range(-1, p.getNumJoints(body_b)):
+            p.setCollisionFilterPair(body_a, body_b, link_a, link_b, 0)
+
+
 # =====================================================================
 class HandoverSim:
     def __init__(self):
@@ -418,6 +435,8 @@ class HandoverSim:
             MOUNT_TRANSLATION, self.mount_orn_offset)
         self.robotiq, self.rq_jidx = load_robotiq_kinematic(rq_init_pos,
                                                             rq_init_orn)
+        _disable_body_collisions(self.robotiq)
+        _disable_body_pair_collisions(self.tb6, self.robotiq)
         open_gripper_urdf(self.robotiq, self.rq_jidx)
 
         for _ in range(50):
@@ -431,6 +450,7 @@ class HandoverSim:
                                   rgbaColor=[0.95, 0.25, 0.15, 1])
         self.object_vis = p.createMultiBody(0.001, os_, ov_,
                                             [0, 0, 0], [0, 0, 0, 1])
+        _disable_body_collisions(self.object_vis)
 
         # ---- human hand proxy ----
         hs_ = p.createCollisionShape(p.GEOM_SPHERE, radius=0.03)
@@ -438,6 +458,7 @@ class HandoverSim:
                                   rgbaColor=[0.2, 0.5, 0.9, 0.5])
         self.hand_proxy = p.createMultiBody(0.001, hs_, hv_,
                                             [0, 0, 0], [0, 0, 0, 1])
+        _disable_body_collisions(self.hand_proxy)
 
         self._sync_rq_to_flange()
         self._sync_attachments()
